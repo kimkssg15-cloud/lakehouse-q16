@@ -483,7 +483,7 @@ def step_maintenance(res):
     out["before"]["query"] = median_run(db, probe)
     old_snap = current_snapshot(db, "bronze.lakehouse", "maint_demo")
     first_snap = db.scalar(f'SELECT snapshot_id FROM bronze.lakehouse."maint_demo$snapshots" '
-                           f'ORDER BY committed_at LIMIT 1 OFFSET 1')
+                           f'ORDER BY committed_at OFFSET 1 LIMIT 1')
     log(f"  до: {out['before']['snapshots']} снапшотов, {out['before']['files']} файлов "
         f"по ~{out['before']['avg_file_kb']} КБ, запрос {out['before']['query']['median_s']} с")
 

@@ -13,6 +13,31 @@
 > Все числа в отчёте получены автоматически скриптом `runner/lakehouse.py` на этом стенде
 > (сырые результаты — `results/results.json`). Методика замеров — в разделе 5.
 
+**Содержание**
+
+- [1. Вариант и масштаб](#1-вариант-и-масштаб)
+- [2. Поднятые сервисы — и почему именно они](#2-поднятые-сервисы--и-почему-именно-они)
+  - [Скрипты, которыми поднимал стек](#скрипты-которыми-поднимал-стек)
+- [3. Разбор запроса — какие данные нужны](#3-разбор-запроса--какие-данные-нужны)
+- [4. Медальон — решения по каждому слою](#4-медальон--решения-по-каждому-слою)
+  - [Bronze (сырой) — бакет bronze](#bronze-сырой--бакет-bronze)
+  - [Silver (очищенный) — бакет silver](#silver-очищенный--бакет-silver)
+  - [Gold (витрина) — бакет gold](#gold-витрина--бакет-gold)
+  - [Зачем нужен медальон — один вопрос, три слоя](#зачем-нужен-медальон--один-вопрос-три-слоя)
+- [5. Тесты производительности](#5-тесты-производительности)
+  - [Методика](#методика)
+  - [Таблица из формы (Parquet, Bronze)](#таблица-из-формы-parquet-bronze)
+  - [Полный бенчмарк: 8 вариантов](#полный-бенчмарк-8-вариантов)
+  - [Анализ](#анализ)
+- [6. Часть 2 — осмысление и работа с инструментами](#6-часть-2--осмысление-и-работа-с-инструментами)
+  - [6.1. Понять и объяснить](#61-понять-и-объяснить)
+  - [6.2. Подключить инструмент к lakehouse](#62-подключить-инструмент-к-lakehouse)
+  - [6.3. Дополнительно: обслуживание таблиц и проблема мелких файлов](#63-дополнительно-обслуживание-таблиц-и-проблема-мелких-файлов)
+- [7. Выводы](#7-выводы)
+  - [Источники](#источники)
+  - [Приложение: скриншоты](#приложение-скриншоты)
+  - [Приложение: структура репозитория](#приложение-структура-репозитория)
+
 ---
 
 ## 1. Вариант и масштаб
@@ -389,6 +414,37 @@ docker compose --profile bi up -d superset    # первый запуск ~2–3
 4. Дашборд по Gold: `Datasets → + Dataset → gold / lakehouse / q16_report` → чарт *Bar Chart*:
    X = `p_size`, метрика `SUM(supplier_cnt)`, разбивка по `p_brand` → дашборд «Q16: поставщики по размерам». — `10_superset_dashboard.png`
 
+### 6.3. Дополнительно: обслуживание таблиц и проблема мелких файлов
+
+Bronze у нас append-only: в реальной системе загрузки идут часто, и **каждая порция — отдельный коммит Iceberg**:
+новый снапшот, новый манифест и новый маленький файл. Чтобы показать, к чему это приводит и как лечится, раннер
+(шаг `maintenance`, ручная версия — `sql/07_maintenance.sql`) загружает таблицу `supplier` в демо-таблицу
+`bronze.lakehouse.maint_demo` **30 микро-порциями**, а затем выполняет `optimize` и `expire_snapshots`.
+После каждого этапа замеряется состояние по метатаблицам и время одного и того же запроса
+(`count(*)`, `sum(s_acctbal)`, `count(DISTINCT s_nationkey)`, медиана 5 замеров).
+
+| Этап | Снапшотов | Файлов данных | Средний файл, КБ | Данные, КБ | Манифестов | Строк | Запрос, медиана с (min–max) | Время операции |
+|---|---|---|---|---|---|---|---|---|
+| После 30 микро-загрузок | 31 | 30 | 175.6 | 5268.0 | 30 | 100 000 | 0.127 (0.114–0.161) | — |
+| После `optimize` | 32 | 1 | 5157.7 | 5157.7 | 31 | 100 000 | 0.106 (0.087–0.143) | 1.15 с |
+| После `expire_snapshots` + `remove_orphan_files` | 1 | 1 | 5157.7 | 5157.7 | 31 | 100 000 | 0.095 (0.089–0.128) | 0.39 с |
+
+* **Мелкие файлы.** 30 загрузок дали 30 файлов по ~176 КБ и 31 снапшотов — при рекомендуемом размере файла Iceberg 128–512 МБ. Каждый файл — это отдельный запрос к S3 и отдельный футер Parquet, который надо прочитать.
+* **`optimize`** склеил их в 1 файл(а) за 1.15 с; запрос ускорился в 1.2 раза (0.127 → 0.106 с). Но снапшотов стало ещё больше (32), а старые мелкие файлы физически остались в MinIO — на них ссылаются старые снапшоты, поэтому time travel к первой загрузке ещё работает (3 333 строк).
+* **`expire_snapshots`** оставил 1 снапшот(а) и удалил файлы, на которые больше никто не ссылается. Цена — история: time travel к первой загрузке теперь невозможен (Trino: «Iceberg snapshot ID does not exists: 3631120581839901438»).
+* **Вывод:** append-only Bronze без регламентного обслуживания постепенно деградирует — файлов, снапшотов и метаданных становится всё больше, планирование и чтение замедляются. Компакцию и очистку снапшотов нужно запускать по расписанию, выбирая retention как баланс между местом и окном восстановления.
+
+**Регламент для Bronze с частыми загрузками** (что я бы поставил в планировщик):
+
+| Операция | Как часто | Зачем |
+|---|---|---|
+| `ALTER TABLE ... EXECUTE optimize` (по свежим партициям) | ежедневно | склеить мелкие файлы дня загрузки в крупные |
+| `ALTER TABLE ... EXECUTE expire_snapshots(retention_threshold => '7d')` | ежедневно | удалить снапшоты старше 7 дней и их файлы; окно time travel — неделя |
+| `ALTER TABLE ... EXECUTE remove_orphan_files(retention_threshold => '7d')` | еженедельно | убрать «осиротевшие» файлы после упавших записей |
+
+Компромисс: чем короче retention, тем меньше места и метаданных, но тем короче окно для time travel и
+восстановления (раздел 6.1). В демо retention = 0 только для наглядности.
+
 ## 7. Выводы
 
 1. **Медальон** разделяет ответственность: Bronze хранит источник как есть (319.14 МБ, можно всё пересчитать), Silver — чистые типизированные данные без лишнего текста (в 3.0 раза меньше), Gold — готовый ответ на бизнес-вопрос, который читается в 48 раз быстрее сырого запроса.
@@ -398,6 +454,26 @@ docker compose --profile bi up -d superset    # первый запуск ~2–3
 5. **Lakehouse** (Iceberg поверх S3) дал то, чего нет у «просто файлов»: ACID-запись, time travel и откат за секунды, эволюцию схемы без перезаписи данных и доступ к одним таблицам из Trino и Superset.
 
 ---
+
+
+### Источники
+
+1. Trino 476 Documentation — Iceberg connector (table properties, time travel, `optimize`, `expire_snapshots`, метатаблицы). https://trino.io/docs/476/connector/iceberg.html
+2. Trino Documentation — TPC-H connector. https://trino.io/docs/current/connector/tpch.html
+3. Apache Iceberg — Table Spec (снапшоты, манифесты, schema evolution по id колонок). https://iceberg.apache.org/spec/
+4. Apache Iceberg — Maintenance (expire snapshots, compaction, orphan files). https://iceberg.apache.org/docs/latest/maintenance/
+5. Apache Iceberg — REST Catalog OpenAPI specification. https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml
+6. Lakekeeper Documentation. https://docs.lakekeeper.io/
+7. TPC Benchmark H Standard Specification (запрос Q16). https://www.tpc.org/tpch/
+8. Apache Parquet — Documentation (колоночное хранение, кодирование, сжатие). https://parquet.apache.org/docs/
+9. Apache ORC — Specification. https://orc.apache.org/specification/
+10. RFC 8878 — Zstandard Compression. https://datatracker.ietf.org/doc/html/rfc8878
+11. RFC 1951 — DEFLATE (основа GZIP). https://datatracker.ietf.org/doc/html/rfc1951
+12. Armbrust M. et al. Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics. CIDR 2021. https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf
+13. Databricks — Medallion Architecture. https://www.databricks.com/glossary/medallion-architecture
+14. Apache Superset — Connecting to Databases (Trino). https://superset.apache.org/docs/configuration/databases
+15. Jacar — How to fix «pull access denied for minio/minio» (прекращение публикации образов MinIO, альтернативы). https://jacar.es/?p=7603
+16. Гайды курса: «Локальный Lakehouse — пошаговый гайд», «Гайд 2. Медальонная архитектура: Bronze → Silver → Gold»; лекция «Р1. Развертывание локального Lakehouse». VK Education, НИТУ МИСИС, 2026.
 
 ### Приложение: скриншоты
 
