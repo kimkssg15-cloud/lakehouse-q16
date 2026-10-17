@@ -47,7 +47,7 @@ def gh_slug(text, seen):
 
 
 def insert_toc(md):
-    """Оглавление по заголовкам ##, ### и нумерованным #### — вставляется на место маркера <!--TOC--> (как содержание в ВКР)."""
+    """Оглавление по заголовкам ## и ### — вставляется на место маркера <!--TOC--> (как содержание в ВКР)."""
     seen, lines, in_code = {}, [], False
     for line in md.splitlines():
         if line.startswith("```"):
@@ -60,11 +60,11 @@ def insert_toc(md):
             continue
         level, title = m.groups()
         slug = gh_slug(title, seen)          # считаем все заголовки, чтобы якоря совпадали с GitHub
-        if level not in ("##", "###", "####") or (level == "####" and not title[0].isdigit()):
+        if level not in ("##", "###") or title.strip() in ("ОТЧЁТ", "СОДЕРЖАНИЕ"):
             continue
         clean = re.sub(r"[`*]", "", title)
         lines.append("  " * (len(level) - 2) + f"- [{clean}](#{slug})")
-    toc = '<h3 align="center">СОДЕРЖАНИЕ</h3>\n\n' + "\n".join(lines)
+    toc = "\n".join(lines)
     if "<!--TOC-->" in md:
         return md.replace("<!--TOC-->", toc, 1)
     return md.replace("\n---\n", "\n" + toc + "\n\n---\n", 1)
