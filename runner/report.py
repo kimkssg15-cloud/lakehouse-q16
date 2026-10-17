@@ -38,6 +38,36 @@ def more_less(a, b, more="больше", less="меньше"):
     return more if a > b else less
 
 
+def gh_slug(text, seen):
+    """Якорь заголовка так, как его строит GitHub: нижний регистр, без пунктуации, пробелы -> '-'."""
+    slug = re.sub(r"[^\w\- ]", "", text.strip().lower()).replace(" ", "-")
+    k = seen.get(slug, 0)
+    seen[slug] = k + 1
+    return slug if k == 0 else f"{slug}-{k}"
+
+
+def insert_toc(md):
+    """Оглавление по заголовкам ## и ### (кроме шапки), вставляется перед первой чертой ---."""
+    seen, lines, in_code = {}, [], False
+    for line in md.splitlines():
+        if line.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        m = re.match(r"^(##|###) (.+)$", line)
+        if not m:
+            continue
+        level, title = m.groups()
+        if title.startswith("Развёртывание локального"):
+            continue
+        slug = gh_slug(title, seen)
+        clean = re.sub(r"[`*]", "", title)
+        lines.append(("" if level == "##" else "  ") + f"- [{clean}](#{slug})")
+    toc = "**Содержание**\n\n" + "\n".join(lines)
+    return md.replace("\n---\n", "\n" + toc + "\n\n---\n", 1)
+
+
 def md_table(header, rows):
     out = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     out += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
@@ -497,6 +527,42 @@ def build(res, root):
             f"{n(ev['old_snapshot_rows'])} строк, колонки: `{', '.join(ev['cols_old_snapshot'])}`. "
             f"Gold не сломался ({n(ev['gold_rows_after'])} строк), снапшотов у таблицы всего: {ev['snapshots_total']}.")
 
+    # --- обслуживание таблиц
+    mt = res.get("maintenance") or {}
+    if mt:
+        ctx["mt_batches"] = str(mt["batches"])
+        stages = [("После {} микро-загрузок".format(mt["batches"]), mt["before"], "—"),
+                  ("После `optimize`", mt["after_optimize"], f"{f2(mt.get('optimize_s'), 2)} с"),
+                  ("После `expire_snapshots` + `remove_orphan_files`", mt["after_expire"], f"{f2(mt.get('expire_s'), 2)} с")]
+        rows = []
+        for name, st, op in stages:
+            rows.append([name, n(st["snapshots"]), n(st["files"]), f2(st["avg_file_kb"], 1), f2(st["kb"], 1),
+                         n(st["manifests"]) if st.get("manifests") is not None else "—", n(st["rows"]),
+                         f"{f2(st['query']['median_s'], 3)} ({f2(st['query']['min_s'], 3)}–{f2(st['query']['max_s'], 3)})", op])
+        ctx["mt_table"] = md_table(["Этап", "Снапшотов", "Файлов данных", "Средний файл, КБ", "Данные, КБ",
+                                    "Манифестов", "Строк", "Запрос, медиана с (min–max)", "Время операции"], rows)
+        b, o, e = mt["before"], mt["after_optimize"], mt["after_expire"]
+        qb, qo = b["query"]["median_s"], o["query"]["median_s"]
+        tt_after = mt.get("tt_after_expire", "")
+        ctx["mt_conclusion"] = (
+            f"* **Мелкие файлы.** {mt['batches']} загрузок дали {n(b['files'])} файлов по ~{f2(b['avg_file_kb'], 0)} КБ "
+            f"и {n(b['snapshots'])} снапшотов — при рекомендуемом размере файла Iceberg 128–512 МБ. Каждый файл — это "
+            f"отдельный запрос к S3 и отдельный футер Parquet, который надо прочитать.\n"
+            f"* **`optimize`** склеил их в {n(o['files'])} файл(а) за {f2(mt.get('optimize_s'), 2)} с; запрос "
+            + (f"ускорился в {fx(qb / qo)} раза ({f2(qb, 3)} → {f2(qo, 3)} с)." if qo < qb else
+               f"почти не изменился ({f2(qb, 3)} → {f2(qo, 3)} с): на таблице в {n(b['rows'])} строк накладные расходы "
+               f"малы, но они растут линейно с числом файлов.")
+            + f" Но снапшотов стало ещё больше ({n(o['snapshots'])}), а старые мелкие файлы физически остались в MinIO — "
+              f"на них ссылаются старые снапшоты, поэтому time travel к первой загрузке ещё работает "
+              f"({n(mt.get('tt_before_expire'))} строк).\n"
+            f"* **`expire_snapshots`** оставил {n(e['snapshots'])} снапшот(а) и удалил файлы, на которые больше никто "
+            f"не ссылается. "
+            + (f"Цена — история: time travel к первой загрузке теперь невозможен (Trino: «{tt_after}»).\n"
+               if tt_after != "доступен" else "Time travel к первой загрузке при этом остался доступен.\n")
+            + f"* **Вывод:** append-only Bronze без регламентного обслуживания постепенно деградирует — файлов, "
+            f"снапшотов и метаданных становится всё больше, планирование и чтение замедляются. Компакцию и очистку "
+            f"снапшотов нужно запускать по расписанию, выбирая retention как баланс между местом и окном восстановления.")
+
     # --- выводы
     if B and S and bench:
         ctx["final_conclusions"] = (
@@ -535,5 +601,6 @@ def build(res, root):
     with open(os.path.join(root, "runner", "report_template.md"), encoding="utf-8") as f:
         tpl = f.read()
     out = re.sub(r"\{\{([a-z0-9_]+)\}\}", lambda m: str(ctx.get(m.group(1), MISSING)), tpl)
+    out = insert_toc(out)
     with open(os.path.join(root, "REPORT.md"), "w", encoding="utf-8") as f:
         f.write(out)

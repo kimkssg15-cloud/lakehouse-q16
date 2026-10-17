@@ -347,11 +347,55 @@ docker compose --profile bi up -d superset    # первый запуск ~2–3
 4. Дашборд по Gold: `Datasets → + Dataset → gold / lakehouse / q16_report` → чарт *Bar Chart*:
    X = `p_size`, метрика `SUM(supplier_cnt)`, разбивка по `p_brand` → дашборд «Q16: поставщики по размерам». — `10_superset_dashboard.png`
 
+### 6.3. Дополнительно: обслуживание таблиц и проблема мелких файлов
+
+Bronze у нас append-only: в реальной системе загрузки идут часто, и **каждая порция — отдельный коммит Iceberg**:
+новый снапшот, новый манифест и новый маленький файл. Чтобы показать, к чему это приводит и как лечится, раннер
+(шаг `maintenance`, ручная версия — `sql/07_maintenance.sql`) загружает таблицу `supplier` в демо-таблицу
+`bronze.lakehouse.maint_demo` **{{mt_batches}} микро-порциями**, а затем выполняет `optimize` и `expire_snapshots`.
+После каждого этапа замеряется состояние по метатаблицам и время одного и того же запроса
+(`count(*)`, `sum(s_acctbal)`, `count(DISTINCT s_nationkey)`, медиана {{runs}} замеров).
+
+{{mt_table}}
+
+{{mt_conclusion}}
+
+**Регламент для Bronze с частыми загрузками** (что я бы поставил в планировщик):
+
+| Операция | Как часто | Зачем |
+|---|---|---|
+| `ALTER TABLE ... EXECUTE optimize` (по свежим партициям) | ежедневно | склеить мелкие файлы дня загрузки в крупные |
+| `ALTER TABLE ... EXECUTE expire_snapshots(retention_threshold => '7d')` | ежедневно | удалить снапшоты старше 7 дней и их файлы; окно time travel — неделя |
+| `ALTER TABLE ... EXECUTE remove_orphan_files(retention_threshold => '7d')` | еженедельно | убрать «осиротевшие» файлы после упавших записей |
+
+Компромисс: чем короче retention, тем меньше места и метаданных, но тем короче окно для time travel и
+восстановления (раздел 6.1). В демо retention = 0 только для наглядности.
+
 ## 7. Выводы
 
 {{final_conclusions}}
 
 ---
+
+
+### Источники
+
+1. Trino 476 Documentation — Iceberg connector (table properties, time travel, `optimize`, `expire_snapshots`, метатаблицы). https://trino.io/docs/476/connector/iceberg.html
+2. Trino Documentation — TPC-H connector. https://trino.io/docs/current/connector/tpch.html
+3. Apache Iceberg — Table Spec (снапшоты, манифесты, schema evolution по id колонок). https://iceberg.apache.org/spec/
+4. Apache Iceberg — Maintenance (expire snapshots, compaction, orphan files). https://iceberg.apache.org/docs/latest/maintenance/
+5. Apache Iceberg — REST Catalog OpenAPI specification. https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml
+6. Lakekeeper Documentation. https://docs.lakekeeper.io/
+7. TPC Benchmark H Standard Specification (запрос Q16). https://www.tpc.org/tpch/
+8. Apache Parquet — Documentation (колоночное хранение, кодирование, сжатие). https://parquet.apache.org/docs/
+9. Apache ORC — Specification. https://orc.apache.org/specification/
+10. RFC 8878 — Zstandard Compression. https://datatracker.ietf.org/doc/html/rfc8878
+11. RFC 1951 — DEFLATE (основа GZIP). https://datatracker.ietf.org/doc/html/rfc1951
+12. Armbrust M. et al. Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics. CIDR 2021. https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf
+13. Databricks — Medallion Architecture. https://www.databricks.com/glossary/medallion-architecture
+14. Apache Superset — Connecting to Databases (Trino). https://superset.apache.org/docs/configuration/databases
+15. Jacar — How to fix «pull access denied for minio/minio» (прекращение публикации образов MinIO, альтернативы). https://jacar.es/?p=7603
+16. Гайды курса: «Локальный Lakehouse — пошаговый гайд», «Гайд 2. Медальонная архитектура: Bronze → Silver → Gold»; лекция «Р1. Развертывание локального Lakehouse». VK Education, НИТУ МИСИС, 2026.
 
 {{screenshots}}
 

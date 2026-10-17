@@ -7,7 +7,7 @@ time travel, schema evolution и автозаполнение REPORT.md реал
     docker compose run --rm runner python runner/lakehouse.py all
 
 Отдельные шаги:
-    setup | bronze | silver | gold | validate | layers | bench | timetravel | evolution | report
+    setup | bronze | silver | gold | validate | layers | bench | timetravel | evolution | maintenance | report
 
 Все результаты складываются в results/results.json (шаги можно перезапускать по одному),
 по ним строятся графики results/*.png и файл REPORT.md (из runner/report_template.md).
@@ -446,6 +446,78 @@ def step_evolution(res):
         f"{files_before}/{files_after_add}; сегменты: {seg}")
 
 
+def maint_stats(db, t):
+    """Состояние таблицы Iceberg по метатаблицам: снапшоты, живые файлы данных, манифесты."""
+    sch, tbl = t.rsplit(".", 1)
+    snaps = db.scalar(f'SELECT count(*) FROM {sch}."{tbl}$snapshots"')
+    r, _, _ = db.run(f'SELECT count(*), coalesce(sum(file_size_in_bytes), 0) FROM {sch}."{tbl}$files"', quiet=True)
+    files, size = r[0]
+    try:
+        manifests = db.scalar(f'SELECT count(*) FROM {sch}."{tbl}$manifests"')
+    except Exception:
+        manifests = None
+    rows = db.scalar(f"SELECT count(*) FROM {t}")
+    return {"snapshots": snaps, "files": files, "bytes": size, "kb": round(size / 1024, 1),
+            "avg_file_kb": round(size / 1024 / max(files, 1), 1), "manifests": manifests, "rows": rows}
+
+
+def step_maintenance(res):
+    """Проблема мелких файлов в append-only Bronze и обслуживание: optimize + expire_snapshots."""
+    batches = 30
+    t = "bronze.lakehouse.maint_demo"
+    db = Trino(session={"bronze.expire_snapshots_min_retention": "0s",
+                        "bronze.remove_orphan_files_min_retention": "0s"})
+    log(f"== обслуживание таблиц: {batches} микро-загрузок в {t}, затем optimize и expire_snapshots")
+    db.run(f"DROP TABLE IF EXISTS {t}", quiet=True)
+    db.run(f"CREATE TABLE {t} WITH (format = 'PARQUET') AS "
+           f"SELECT * FROM bronze.lakehouse.supplier WITH NO DATA", quiet=True)
+    t0 = time.perf_counter()
+    for i in range(batches):  # имитация потоковой/частой загрузки: каждая порция = отдельный коммит
+        db.run(f"INSERT INTO {t} SELECT * FROM bronze.lakehouse.supplier WHERE s_suppkey % {batches} = {i}",
+               quiet=True)
+    load_s = round(time.perf_counter() - t0, 2)
+    probe = f"SELECT count(*), sum(s_acctbal), count(DISTINCT s_nationkey) FROM {t}"
+    out = {"batches": batches, "load_s": load_s}
+
+    out["before"] = maint_stats(db, t)
+    out["before"]["query"] = median_run(db, probe)
+    old_snap = current_snapshot(db, "bronze.lakehouse", "maint_demo")
+    first_snap = db.scalar(f'SELECT snapshot_id FROM bronze.lakehouse."maint_demo$snapshots" '
+                           f'ORDER BY committed_at LIMIT 1 OFFSET 1')
+    log(f"  до: {out['before']['snapshots']} снапшотов, {out['before']['files']} файлов "
+        f"по ~{out['before']['avg_file_kb']} КБ, запрос {out['before']['query']['median_s']} с")
+
+    _, _, m = db.run(f"ALTER TABLE {t} EXECUTE optimize")
+    out["optimize_s"] = m["elapsed_s"]
+    out["after_optimize"] = maint_stats(db, t)
+    out["after_optimize"]["query"] = median_run(db, probe)
+    out["tt_before_expire"] = db.scalar(f"SELECT count(*) FROM {t} FOR VERSION AS OF {first_snap}")
+    log(f"  после optimize: {out['after_optimize']['snapshots']} снапшотов, {out['after_optimize']['files']} файлов, "
+        f"запрос {out['after_optimize']['query']['median_s']} с; time travel к 1-й загрузке: {out['tt_before_expire']} строк")
+
+    _, _, m = db.run(f"ALTER TABLE {t} EXECUTE expire_snapshots(retention_threshold => '0s')")
+    out["expire_s"] = m["elapsed_s"]
+    try:
+        _, _, m = db.run(f"ALTER TABLE {t} EXECUTE remove_orphan_files(retention_threshold => '0s')")
+        out["orphans_s"] = m["elapsed_s"]
+    except Exception as e:
+        out["orphans_error"] = str(e)[:200]
+    out["after_expire"] = maint_stats(db, t)
+    out["after_expire"]["query"] = median_run(db, probe)
+    try:
+        db.scalar(f"SELECT count(*) FROM {t} FOR VERSION AS OF {first_snap}")
+        out["tt_after_expire"] = "доступен"
+    except Exception as e:
+        msg = str(e)
+        m2 = re.search(r'message="([^"]+)"', msg)
+        out["tt_after_expire"] = (m2.group(1) if m2 else msg)[:160]
+    out["first_snapshot"] = first_snap
+    out["old_snapshot"] = old_snap
+    log(f"  после expire_snapshots: {out['after_expire']['snapshots']} снапшот(ов), {out['after_expire']['files']} файлов; "
+        f"time travel к 1-й загрузке: {out['tt_after_expire']}")
+    res["maintenance"] = out
+
+
 # ----------------------------------------------------------------------------- report
 def step_report(res):
     import report
@@ -463,9 +535,10 @@ STEPS = {
     "bench": step_bench,
     "timetravel": step_timetravel,
     "evolution": step_evolution,
+    "maintenance": step_maintenance,
     "report": step_report,
 }
-ALL = ["setup", "bronze", "silver", "gold", "validate", "layers", "bench", "timetravel", "evolution", "report"]
+ALL = ["setup", "bronze", "silver", "gold", "validate", "layers", "bench", "timetravel", "evolution", "maintenance", "report"]
 
 
 def main(argv):

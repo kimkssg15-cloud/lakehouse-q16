@@ -17,6 +17,7 @@
 | Агрегированная витрина для BI → **Gold** + проверка корректности против Q16 | `sql/03_gold.sql`, `sql/04_q16.sql` |
 | Бенчмарк: размер, время записи, скорость агрегаций для 2 форматов × 4 кодеков | `runner/lakehouse.py bench`, `results/` |
 | Time travel и восстановление из снапшота, schema evolution | `sql/05_time_travel.sql`, `sql/06_schema_evolution.sql` |
+| Обслуживание таблиц: проблема мелких файлов, `optimize`, `expire_snapshots` | `sql/07_maintenance.sql`, шаг `maintenance` |
 | BI-инструмент поверх lakehouse (Superset) | `superset/`, раздел 6.2 отчёта |
 | Методология и выводы | этот README + [REPORT.md](REPORT.md) |
 
@@ -70,7 +71,7 @@ docker compose run --rm runner python runner/lakehouse.py all
 docker compose --profile bi up -d superset
 ```
 
-Шаги можно запускать по отдельности: `... lakehouse.py bronze silver gold validate layers bench timetravel evolution report`.
+Шаги можно запускать по отдельности: `... lakehouse.py bronze silver gold validate layers bench timetravel evolution maintenance report`.
 Результаты копятся в `results/results.json`, после любого шага можно перестроить отчёт: `... lakehouse.py report`.
 
 На Windows то же самое делает `scripts\run_all.ps1`, на macOS/Linux — `scripts/run_all.sh`.
@@ -130,6 +131,7 @@ sql/
   04_q16.sql                Q16 по трём слоям + проверка совпадения
   05_time_travel.sql        восстановление из снапшота (для DBeaver)
   06_schema_evolution.sql   эволюция схемы (для DBeaver)
+  07_maintenance.sql        мелкие файлы, optimize, expire_snapshots (для DBeaver)
 runner/
   lakehouse.py              пайплайн, проверки, бенчмарк, time travel, evolution
   report.py                 графики + заполнение REPORT.md
