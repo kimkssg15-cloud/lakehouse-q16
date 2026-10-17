@@ -47,7 +47,7 @@ def gh_slug(text, seen):
 
 
 def insert_toc(md):
-    """Оглавление по заголовкам ## и ### (кроме шапки), вставляется перед первой чертой ---."""
+    """Оглавление по заголовкам ##, ### и нумерованным #### — вставляется на место маркера <!--TOC--> (как содержание в ВКР)."""
     seen, lines, in_code = {}, [], False
     for line in md.splitlines():
         if line.startswith("```"):
@@ -55,16 +55,18 @@ def insert_toc(md):
             continue
         if in_code:
             continue
-        m = re.match(r"^(##|###) (.+)$", line)
+        m = re.match(r"^(#{1,6}) (.+)$", line)
         if not m:
             continue
         level, title = m.groups()
-        if title.startswith("Развёртывание локального"):
+        slug = gh_slug(title, seen)          # считаем все заголовки, чтобы якоря совпадали с GitHub
+        if level not in ("##", "###", "####") or (level == "####" and not title[0].isdigit()):
             continue
-        slug = gh_slug(title, seen)
         clean = re.sub(r"[`*]", "", title)
-        lines.append(("" if level == "##" else "  ") + f"- [{clean}](#{slug})")
-    toc = "**Содержание**\n\n" + "\n".join(lines)
+        lines.append("  " * (len(level) - 2) + f"- [{clean}](#{slug})")
+    toc = '<h3 align="center">СОДЕРЖАНИЕ</h3>\n\n' + "\n".join(lines)
+    if "<!--TOC-->" in md:
+        return md.replace("<!--TOC-->", toc, 1)
     return md.replace("\n---\n", "\n" + toc + "\n\n---\n", 1)
 
 
@@ -308,7 +310,7 @@ def bench_texts(res, ctx):
         if nz:
             parts.append(f"относительно несжатого Parquet экономит {100 - z['mb'] / nz['mb'] * 100:.0f} % места "
                          f"(а значит, и трафика до S3)")
-        ctx["_choice_summary"] = "; ".join(parts) + ". Место варианта в рейтинге по формуле — в разделе 5."
+        ctx["_choice_summary"] = "; ".join(parts) + ". Место варианта в рейтинге по формуле — в п. 3.5."
 
     # Итоговый выбор: взвешенная оценка, нормированная на лучший вариант
     def score(v, w):
@@ -402,7 +404,7 @@ def build(res, root):
             f"{f2(zp['write_s'])} с против {f2(gp['write_s'])} с у GZIP. Parquet — колоночный стандарт Iceberg.")
     else:
         ctx["bronze_reason"] = ("Сырой слой пишется один раз и хранится долго → главное размер при приемлемой "
-                                "скорости записи; ZSTD — лучший баланс (см. раздел 5). Parquet — колоночный стандарт Iceberg.")
+                                "скорости записи; ZSTD — лучший баланс (см. п. 3.5). Parquet — колоночный стандарт Iceberg.")
 
     total_min = sum((res.get("step_s") or {}).values()) / 60
     bronze_mb = sum(s["mb"] for s in B.values()) if B else None
@@ -595,7 +597,7 @@ def build(res, root):
     ]
     sdir = os.path.join(root, "docs", "screenshots")
     present = [(f, c) for f, c in shots if os.path.exists(os.path.join(sdir, f))]
-    ctx["screenshots"] = ("### Приложение: скриншоты\n\n" + "\n\n".join(
+    ctx["screenshots"] = ("## ПРИЛОЖЕНИЕ А. Скриншоты\n\n" + "\n\n".join(
         f"**{i}. {c}**\n\n![{c}](docs/screenshots/{f})" for i, (f, c) in enumerate(present, 1))) if present else ""
 
     with open(os.path.join(root, "runner", "report_template.md"), encoding="utf-8") as f:
