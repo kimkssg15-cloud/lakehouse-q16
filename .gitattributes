@@ -1,0 +1,8 @@
+# Скрипты и конфиги должны иметь LF-переносы даже на Windows,
+# иначе /bin/sh в контейнере и Trino их не прочитают
+*.sh          text eol=lf
+*.properties  text eol=lf
+*.sql         text eol=lf
+*.yml         text eol=lf
+*.py          text eol=lf
+Dockerfile    text eol=lf

@@ -1,0 +1,134 @@
+# Локальный Lakehouse: MinIO (S3) + PostgreSQL + Lakekeeper (Iceberg REST Catalog) + Trino
+# Запуск:   docker compose up -d --remove-orphans
+# Пайплайн: docker compose run --rm runner python runner/lakehouse.py all
+# BI:       docker compose --profile bi up -d superset   (http://localhost:8088, admin/admin)
+#
+# Отличие от гайда (docker run): всё в одной сети compose, сервисы видят друг друга
+# по именам (minio, lakekeeper, trino), поэтому host.docker.internal не нужен
+# и одинаково работает на Windows / macOS / Linux.
+
+name: lakehouse
+
+x-lakekeeper-env: &lakekeeper-env
+  LAKEKEEPER__PG_ENCRYPTION_KEY: "This-is-NOT-Secure!"
+  LAKEKEEPER__PG_DATABASE_URL_READ: "postgresql://postgres:postgres@postgres:5432/postgres"
+  LAKEKEEPER__PG_DATABASE_URL_WRITE: "postgresql://postgres:postgres@postgres:5432/postgres"
+
+services:
+  # 1. MinIO — S3-совместимое объектное хранилище, сюда физически падают parquet/orc-файлы.
+  # ВАЖНО: с сентября 2026 MinIO больше не публикует образы (minio/minio удалён с Docker Hub,
+  # quay.io/minio/minio отдаёт 401, community-версия распространяется только исходниками).
+  # Поэтому берём Silo — community-сборку того же MinIO с зафиксированной версией (Docker Hub,
+  # без регистрации, совместима по API, переменным и командам).
+  minio:
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    container_name: lakehouse-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    restart: unless-stopped
+
+  # 2. PostgreSQL — база, где Lakekeeper хранит метаданные каталога
+  postgres:
+    image: postgres:17
+    container_name: lakehouse-pg
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports: ["5432:5432"]
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # 3a. Миграции схемы Lakekeeper (одноразово)
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakekeeper-migrate
+    environment: *lakekeeper-env
+    command: ["migrate"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  # 3. Lakekeeper — Iceberg REST Catalog (UI: http://localhost:8181/ui)
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakekeeper
+    environment: *lakekeeper-env
+    command: ["serve"]
+    ports: ["8181:8181"]
+    depends_on:
+      lakekeeper-migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  # 3b. Одноразовый контейнер: бакеты в MinIO (S3 API, подпись SigV4 через curl)
+  #     + Terms of Use + 3 warehouse (bronze/silver/gold) в Lakekeeper
+  lakekeeper-init:
+    image: curlimages/curl:8.11.1
+    container_name: lakekeeper-init
+    entrypoint: ["/bin/sh", "/init/create-warehouses.sh"]
+    volumes: ["./init:/init:ro"]
+    depends_on:
+      lakekeeper: {condition: service_started}
+      minio: {condition: service_started}
+    restart: "no"
+
+  # 4. Trino — SQL-движок (UI: http://localhost:8080, пользователь любой, пароль пустой)
+  trino:
+    image: trinodb/trino:476
+    container_name: trino
+    ports: ["8080:8080"]
+    volumes:
+      - ./catalog:/etc/trino/catalog:ro   # bronze/silver/gold (Iceberg) + tpch (генератор)
+      - ./sql:/sql:ro                     # чтобы можно было: docker exec trino trino --file /sql/...
+    depends_on:
+      lakekeeper-init: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  # 5. Runner — Python + trino-client: пайплайн Bronze→Silver→Gold, бенчмарк, отчёт
+  runner:
+    build: ./runner
+    image: lakehouse-runner:1.0
+    profiles: ["tools"]
+    environment:
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
+      SF: ${SF:-sf10}
+      BENCH_RUNS: ${BENCH_RUNS:-5}
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: utf-8
+    volumes: ["./:/work"]
+    working_dir: /work
+    depends_on:
+      trino: {condition: service_healthy}
+
+  # 6. Superset — BI поверх lakehouse (Часть 2, п. 6.2)
+  superset:
+    build: ./superset
+    image: lakehouse-superset:1.0
+    container_name: superset
+    profiles: ["bi"]
+    environment:
+      SUPERSET_SECRET_KEY: "local-lab-secret-key-change-me"
+    ports: ["8088:8088"]
+    volumes: [superset-data:/app/superset_home]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        superset db upgrade &&
+        (superset fab create-admin --username admin --firstname Samira --lastname Stepanova --email admin@example.com --password admin || true) &&
+        superset init &&
+        /usr/bin/run-server.sh
+    depends_on:
+      trino: {condition: service_healthy}
+
+volumes:
+  minio-data:
+  pg-data:
+  superset-data:
